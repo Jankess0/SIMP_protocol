@@ -82,16 +82,16 @@ class HelloPayload:
     device_id: int
     
     def encode(self) -> bytes:
-        return struct.pack("Q", self.device_id)
+        return struct.pack(">Q", self.device_id)
     
     @classmethod
     def decode(cls, data: bytes) -> 'HelloPayload':
-        device_id = struct.unpack("Q", data[:8])[0]
+        device_id = struct.unpack(">Q", data[:8])[0]
         return cls(device_id = device_id)
     
 @dataclass
 class AuthPayload:
-    password: int
+    password: str
     
     def encode(self) -> bytes:
         pwd_bytes = self.password.encode('utf-8')
@@ -155,7 +155,7 @@ class AlertPayload:
     value: float
     
     def encode(self) -> bytes:
-        return struct(">BBf", self.alert_code, self.sensor_type, self.value)
+        return struct.pack(">BBf", self.alert_code, self.sensor_type, self.value)
     
     @classmethod
     def decode(cls, data: bytes) -> 'AlertPayload':
