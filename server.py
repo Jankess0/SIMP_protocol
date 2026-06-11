@@ -3,14 +3,22 @@ import ssl
 import threading
 import struct
 import os
+import csv
 
 from simp_protocol import (
     SimpHeader, MessageType, ErrorType,
-    HelloPayload, AuthPayload, AuthOkPayload, AuthFailPayload
+    HelloPayload, AuthPayload, AuthOkPayload, AuthFailPayload,
+    TelemetryPayload
 )
 
 HOST = '0.0.0.0'  
-PORT = 8883       
+PORT = 8883      
+CSV_FILE = "telemetry_data.csv" 
+
+if not os.path.exists(CSV_FILE):
+    with open(CSV_FILE, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(["timestamp", "device_id", "sensor_type", "value"])
 
 # Słownik w formacie: { device_id: "hasło" }
 AUTHORIZED_DEVICES = {
@@ -78,7 +86,44 @@ def handle_client(conn: ssl.SSLSocket, addr: tuple):
             conn.sendall(ok_header.encode() + ok_payload_bytes)
             print(f"[+] Autoryzacja udana! Wydano token sesji: {session_token}")
             
-            # TODO: petla na TELEMETRY i PING
+            # petla sesji
+            while True:
+                # Czekamy na kolejny nagłówek
+                next_header_bytes = recv_exact(conn, 15)
+                if not next_header_bytes:
+                    print(f"[*] Urządzenie {device_id} bezpiecznie rozłączone.")
+                    break
+
+                req_header = SimpHeader.decode(next_header_bytes)
+
+                # Weryfikacja tokenu bezpieczeństwa przy KAŻDEJ ramce
+                if req_header.session_token != session_token:
+                    print(f"[-] Błąd! Nieprawidłowy token sesji od urządzenia {device_id}")
+                    break
+
+                req_payload_bytes = b""
+                if req_header.payload_len > 0:
+                    req_payload_bytes = recv_exact(conn, req_header.payload_len)
+
+                if req_header.msg_type == MessageType.TELEMETRY:
+                    telemetry = TelemetryPayload.decode(req_payload_bytes)
+                    print(f"[TELEMETRIA] ID: {device_id} | Typ czujnika: {telemetry.sensor_type} | Wartość: {telemetry.value:.2f}")
+                    
+                    # zapis do CSV
+                    with open(CSV_FILE, 'a', newline='') as f:
+                        writer = csv.writer(f)
+                        writer.writerow([telemetry.timestamp, device_id, telemetry.sensor_type, round(telemetry.value, 4)])
+
+                elif req_header.msg_type == MessageType.PING:
+                    print(f"[*] Otrzymano PING od {device_id}. Odsyłam PONG.")
+                    pong_header = SimpHeader(1, MessageType.PONG, 0, session_token, 0)
+                    conn.sendall(pong_header.encode())
+                    
+                elif req_header.msg_type == MessageType.BYE:
+                    print(f"[*] Urządzenie {device_id} zakończyło sesję (BYE).")
+                    break
+                else:
+                    print(f"[!] Odebrano nieobsługiwaną ramkę: {req_header.msg_type.name}")
             
         else:
             # blad autoryzacji AUTH_FAIL
