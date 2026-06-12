@@ -1,0 +1,85 @@
+import ssl
+
+from simp_protocol import (
+    SimpHeader, MessageType, ErrorType,
+    HelloPayload, AuthPayload, AuthOkPayload, AuthFailPayload,
+    TelemetryPayload
+)
+from server.auth import verify_device, generate_session_token
+from server.storage import save_telemetry
+
+def recv_exact(conn: ssl.SSLSocket, n: int) -> bytes:
+    """Czyta n bajtów ze strumienia."""
+    data = bytearray()
+    while len(data) < n:
+        packet = conn.recv(n - len(data))
+        if not packet:
+            return None
+        data.extend(packet)
+    return bytes(data)
+
+def handle_client(conn: ssl.SSLSocket, addr: tuple):
+    """Główna pętla stanów sesji dla wątku czujnika."""
+    print(f"\n[+] Nowe bezpieczne połączenie od: {addr}")
+    try:
+        # HELLO
+        header_bytes = recv_exact(conn, 15)
+        if not header_bytes: return
+        header = SimpHeader.decode(header_bytes)
+        if header.msg_type != MessageType.HELLO: return
+        device_id = HelloPayload.decode(recv_exact(conn, header.payload_len)).device_id
+
+        # AUTH 
+        header_bytes = recv_exact(conn, 15)
+        if not header_bytes: return
+        header = SimpHeader.decode(header_bytes)
+        if header.msg_type != MessageType.AUTH: return
+        password = AuthPayload.decode(recv_exact(conn, header.payload_len)).password
+
+        # WERYFIKACJA
+        if verify_device(device_id, password):
+            session_token = generate_session_token()
+            ok_payload_bytes = AuthOkPayload(session_token=session_token).encode()
+            ok_header = SimpHeader(1, MessageType.AUTH_OK, 0, 0, len(ok_payload_bytes))
+            conn.sendall(ok_header.encode() + ok_payload_bytes)
+            print(f"[+] Urządzenie {device_id} autoryzowane.")
+
+            # ACTIVE
+            while True:
+                next_header_bytes = recv_exact(conn, 15)
+                if not next_header_bytes: break
+                
+                req_header = SimpHeader.decode(next_header_bytes)
+
+                # Weryfikacja autoryzacji
+                if req_header.session_token != session_token:
+                    print(f"[-] Błąd tokenu dla urządzenia {device_id}")
+                    break
+
+                req_payload_bytes = b""
+                if req_header.payload_len > 0:
+                    req_payload_bytes = recv_exact(conn, req_header.payload_len)
+
+                # Przetwarzanie ramek
+                if req_header.msg_type == MessageType.TELEMETRY:
+                    telemetry = TelemetryPayload.decode(req_payload_bytes)
+                    save_telemetry(telemetry.timestamp, device_id, telemetry.sensor_type, telemetry.value)
+                    print(f"[TELEMETRIA] {device_id} -> {telemetry.value:.2f}°C")
+                    
+                elif req_header.msg_type == MessageType.PING:
+                    pong_header = SimpHeader(1, MessageType.PONG, 0, session_token, 0)
+                    conn.sendall(pong_header.encode())
+                    
+                elif req_header.msg_type == MessageType.BYE:
+                    print(f"[*] Urządzenie {device_id} zakończyło sesję.")
+                    break
+        else:
+            fail_payload_bytes = AuthFailPayload(error_code=ErrorType.AUTH_INVALID).encode()
+            fail_header = SimpHeader(1, MessageType.AUTH_FAIL, 0, 0, len(fail_payload_bytes))
+            conn.sendall(fail_header.encode() + fail_payload_bytes)
+            print(f"[-] Odrzucono próbę autoryzacji dla: {device_id}")
+
+    except Exception as e:
+        print(f"[-] Błąd w sesji z {addr}: {e}")
+    finally:
+        conn.close()
