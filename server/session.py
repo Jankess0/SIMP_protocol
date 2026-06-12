@@ -1,4 +1,5 @@
 import ssl
+import threading
 
 from simp_protocol import (
     SimpHeader, MessageType, ErrorType,
@@ -7,6 +8,21 @@ from simp_protocol import (
 )
 from server.auth import verify_device, generate_session_token
 from server.storage import save_telemetry
+
+ACTIVE_SESSIONS = {}
+session_lock = threading.Lock()
+
+def add_session(device_id: int, conn: ssl.SSLSocket):
+    """Bezpiecznie dodaje połączenie do rejestru."""
+    with session_lock:
+        ACTIVE_SESSIONS[device_id] = conn
+
+def remove_session(device_id: int):
+    """Bezpiecznie usuwa połączenie z rejestru."""
+    with session_lock:
+        if device_id in ACTIVE_SESSIONS:
+            del ACTIVE_SESSIONS[device_id]
+            print(f"[*] Wyrejestrowano urządzenie {device_id} z aktywnych sesji.")
 
 def recv_exact(conn: ssl.SSLSocket, n: int) -> bytes:
     """Czyta n bajtów ze strumienia."""
@@ -21,6 +37,9 @@ def recv_exact(conn: ssl.SSLSocket, n: int) -> bytes:
 def handle_client(conn: ssl.SSLSocket, addr: tuple):
     """Główna pętla stanów sesji dla wątku czujnika."""
     print(f"\n[+] Nowe bezpieczne połączenie od: {addr}")
+    
+    device_id = None
+    
     try:
         # HELLO
         header_bytes = recv_exact(conn, 15)
@@ -43,6 +62,8 @@ def handle_client(conn: ssl.SSLSocket, addr: tuple):
             ok_header = SimpHeader(1, MessageType.AUTH_OK, 0, 0, len(ok_payload_bytes))
             conn.sendall(ok_header.encode() + ok_payload_bytes)
             print(f"[+] Urządzenie {device_id} autoryzowane.")
+            
+            add_session(device_id, conn)
 
             # ACTIVE
             while True:
@@ -82,4 +103,6 @@ def handle_client(conn: ssl.SSLSocket, addr: tuple):
     except Exception as e:
         print(f"[-] Błąd w sesji z {addr}: {e}")
     finally:
+        if device_id is not None:
+            remove_session(device_id)
         conn.close()
