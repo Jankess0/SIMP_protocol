@@ -1,5 +1,4 @@
 import datetime
-import socket
 import ssl
 import hashlib
 import sys
@@ -11,7 +10,7 @@ from collections import deque
 
 from simp_protocol import (
     SimpHeader, MessageType, ErrorType,
-    HelloPayload, AuthPayload, AuthOkPayload, AuthFailPayload,
+    HelloPayload, AuthPayload, AuthOkPayload,
     TelemetryPayload, AlertPayload, ErrorPayload,
     CommandPayload, AckPayload
 )
@@ -30,7 +29,7 @@ def recv_exact(conn, n: int) -> bytes:
     while len(data) < n:
         packet = conn.recv(n - len(data))
         if not packet:
-            return None
+            raise EOFError("Connection closed.")
         data.extend(packet)
     return bytes(data)
 
@@ -143,7 +142,7 @@ def send_alert_with_retry(conn, session_token, current_temp):
 
     try:
         conn.sendall(err_header.encode() + err_bytes)
-    except Exception:
+    except ValueError:
         pass
 
     raise ConnectionError("Nie otrzymano ACK po 3 ponowieniach dla ALERT.")
@@ -166,7 +165,7 @@ def process_incoming_frame(conn, session_token, header_bytes, last_cmd_seq):
         if cmd_payload.cmd_seq == last_cmd_seq:
             print(
                 f"[*] Wykryto duplikat komendy (seq: {cmd_payload.cmd_seq}). Zignorowano wykonanie, samo ACK zostało odesłane.")
-            return ("CMD_DUPLICATE", None, last_cmd_seq)
+            return "CMD_DUPLICATE", None, last_cmd_seq
         print(f"[+] Otrzymano COMMAND (ID: {cmd_payload.cmd_id}). Wysłano ACK (seq: {cmd_payload.cmd_seq}).")
 
         cmd_id = cmd_payload.cmd_id
@@ -176,33 +175,33 @@ def process_incoming_frame(conn, session_token, header_bytes, last_cmd_seq):
                     new_interval = int(cmd_payload.param.decode().strip('\x00'))
                 else:
                     new_interval = int(cmd_payload.param)
-            except Exception:
+            except (ConnectionError, TimeoutError):
                 new_interval = 5
             print(f"[*] Wykonuję komendę SET_INTERVAL. Nowy interwał: {new_interval} s")
-            return ("CMD_SET_INTERVAL", new_interval, cmd_payload.cmd_seq)
+            return "CMD_SET_INTERVAL", new_interval, cmd_payload.cmd_seq
 
         elif cmd_id == 2:
             print("[*] Wykonuję komendę SET_THRESHOLD (Wkrótce wdrożone)...")
-            return ("CMD_SET_THRESHOLD", cmd_payload.param, cmd_payload.cmd_seq)
+            return "CMD_SET_THRESHOLD", cmd_payload.param, cmd_payload.cmd_seq
 
         elif cmd_id == 3:
             print("[!] Otrzymano komendę REBOOT. Wymuszam restart urządzenia...")
-            return ("CMD_REBOOT", None, cmd_payload.cmd_seq)
+            return "CMD_REBOOT", None, cmd_payload.cmd_seq
 
         else:
             print(f"[!] Otrzymano nieznaną komendę (cmd_id: {cmd_id}). Ignoruję zawartość.")
-            return ("CMD_UNKNOWN", None, last_cmd_seq)
+            return "CMD_UNKNOWN", None, last_cmd_seq
 
     elif resp_header.msg_type == MessageType.ERROR:
         err_data = ErrorPayload.decode(payload_bytes)
         raise ConnectionError(f"Serwer odesłał ERROR! Kod: {err_data.error_code.name}, Msg: {err_data.msg}")
 
     elif resp_header.msg_type == MessageType.PONG:
-        return ("PONG", None, last_cmd_seq)
+        return "PONG", None, last_cmd_seq
 
     else:
         print(f"[!] Zignorowano nieoczekiwaną ramkę w tle: {resp_header.msg_type.name}")
-        return (resp_header.msg_type.name, None, last_cmd_seq)
+        return resp_header.msg_type.name, None, last_cmd_seq
 
 def main():
     telemetry_buffer = deque(maxlen=100)
@@ -212,6 +211,7 @@ def main():
     print("[*] Uruchamiam symulator sensora SIMP...")
     while True:
         conn = None
+        session_token = 0
         try:
             #Nawiazanie polaczenia
             conn = create_tls_connection(SERVER_HOST, SERVER_PORT, EXPECTED_FINGERPRINT)
@@ -352,7 +352,7 @@ def main():
             if conn:
                 try:
                     conn.close()
-                except:
+                except OSError:
                     pass
 
             wait_time = backoff_steps[backoff_index]
@@ -376,7 +376,7 @@ def main():
                 try:
                     bye_header = SimpHeader(1, MessageType.BYE, 0, session_token, 0)
                     conn.sendall(bye_header.encode())
-                except:
+                except BrokenPipeError.cleanup():
                     pass
                 conn.close()
             sys.exit(0)
