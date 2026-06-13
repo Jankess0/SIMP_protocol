@@ -4,7 +4,7 @@ import threading
 from simp_protocol import (
     SimpHeader, MessageType, ErrorType,
     HelloPayload, AuthPayload, AuthOkPayload, AuthFailPayload,
-    TelemetryPayload
+    TelemetryPayload, AlertPayload, AckPayload
 )
 from server.auth import verify_device, generate_session_token
 from server.storage import save_telemetry
@@ -81,11 +81,29 @@ def handle_client(conn: ssl.SSLSocket, addr: tuple):
                 if req_header.payload_len > 0:
                     req_payload_bytes = recv_exact(conn, req_header.payload_len)
 
-                # Przetwarzanie ramek
+                # Przetwarzanie ramek TELEMETRY
                 if req_header.msg_type == MessageType.TELEMETRY:
                     telemetry = TelemetryPayload.decode(req_payload_bytes)
                     save_telemetry(telemetry.timestamp, device_id, telemetry.sensor_type, telemetry.value)
                     print(f"[TELEMETRIA] {device_id} -> {telemetry.value:.2f}°C")
+                
+                # ALERT
+                elif req_header.msg_type == MessageType.ALERT:  
+                    alert = AlertPayload.decode(req_payload_bytes)
+                    print(f"\n[!!!] ALERT KRYTYCZNY Z URZĄDZENIA {device_id} [!!!]")
+                    print(f"      Typ czujnika: {alert.sensor_type}, Wartość: {alert.value:.2f}\n")
+                    
+                    # sprawdzenie czy flaga ACK_REQ i odesłanie ACK
+                    if req_header.flags & 0x01:
+                        ack_payload = AckPayload(ack_seq=1).encode()
+                        ack_header = SimpHeader(1, MessageType.ACK, 0, session_token, len(ack_payload))
+                        conn.sendall(ack_header.encode() + ack_payload)
+                        print(f"[*] Odesłano potwierdzenie ACK do urządzenia {device_id}.")
+                        
+                # odebranie ACK po wysłaniu komendy
+                elif req_header.msg_type == MessageType.ACK:
+                    ack = AckPayload.decode(req_payload_bytes)
+                    print(f"[+] Otrzymano ACK (seq: {ack.ack_seq}) od urządzenia {device_id}.")
                     
                 elif req_header.msg_type == MessageType.PING:
                     pong_header = SimpHeader(1, MessageType.PONG, 0, session_token, 0)
