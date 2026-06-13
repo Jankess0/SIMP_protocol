@@ -9,9 +9,7 @@ from simp_protocol import (
 
 class TestSimpProtocol(unittest.TestCase):
 
-    # ==========================================
     # TESTY NAGŁÓWKA
-    # ==========================================
     def test_header_encode_decode(self):
         # Araange
         header = SimpHeader(
@@ -46,9 +44,7 @@ class TestSimpProtocol(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Przekroczenie limitu"):
             SimpHeader.decode(bad_encoded)
 
-    # ==========================================
-    # TESTY ŁADUNKÓW (PAYLOADS)
-    # ==========================================
+    # TESTY PAYLOAD
     def test_hello_payload(self):
         # Arrange
         payload = HelloPayload(device_id=987654321098765)
