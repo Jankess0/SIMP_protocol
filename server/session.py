@@ -1,10 +1,11 @@
 import ssl
 import threading
+import socket
 
 from simp_protocol import (
     SimpHeader, MessageType, ErrorType,
     HelloPayload, AuthPayload, AuthOkPayload, AuthFailPayload,
-    TelemetryPayload, AlertPayload, AckPayload
+    TelemetryPayload, AlertPayload, AckPayload, ErrorPayload
 )
 from server.auth import verify_device, generate_session_token
 from server.storage import save_telemetry
@@ -41,6 +42,8 @@ def handle_client(conn: ssl.SSLSocket, addr: tuple):
     device_id = None
     
     try:
+        conn.settimeout(15.0)
+        
         # HELLO
         header_bytes = recv_exact(conn, 15)
         if not header_bytes: return
@@ -64,6 +67,7 @@ def handle_client(conn: ssl.SSLSocket, addr: tuple):
             print(f"[+] Urządzenie {device_id} autoryzowane.")
             
             add_session(device_id, conn)
+            conn.settimeout(35.0)
 
             # ACTIVE
             while True:
@@ -75,6 +79,9 @@ def handle_client(conn: ssl.SSLSocket, addr: tuple):
                 # Weryfikacja autoryzacji
                 if req_header.session_token != session_token:
                     print(f"[-] Błąd tokenu dla urządzenia {device_id}")
+                    err_payload = ErrorPayload(error_code=ErrorType.AUTH_INVALID, msg="Invalid token").encode()
+                    err_header = SimpHeader(1, MessageType.ERROR, 0, session_token, len(err_payload)).encode()
+                    conn.sendall(err_header + err_payload)
                     break
 
                 req_payload_bytes = b""
@@ -112,12 +119,15 @@ def handle_client(conn: ssl.SSLSocket, addr: tuple):
                 elif req_header.msg_type == MessageType.BYE:
                     print(f"[*] Urządzenie {device_id} zakończyło sesję.")
                     break
+
         else:
             fail_payload_bytes = AuthFailPayload(error_code=ErrorType.AUTH_INVALID).encode()
             fail_header = SimpHeader(1, MessageType.AUTH_FAIL, 0, 0, len(fail_payload_bytes))
             conn.sendall(fail_header.encode() + fail_payload_bytes)
             print(f"[-] Odrzucono próbę autoryzacji dla: {device_id}")
 
+    except socket.timeout:
+        print(f"[-] TIMEOUT SESJI. Brak aktywności z {addr}. Rozłączanie.")
     except Exception as e:
         print(f"[-] Błąd w sesji z {addr}: {e}")
     finally:

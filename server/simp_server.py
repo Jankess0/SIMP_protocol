@@ -4,6 +4,7 @@ import threading
 
 from server.session import handle_client
 from server.storage import init_storage
+from server.cli import start_cli
 
 HOST = '0.0.0.0'
 PORT = 8883
@@ -25,6 +26,10 @@ def start_server():
     server_socket.listen(50) 
     
     print(f"[*] Serwer SIMP nasłuchuje na {HOST}:{PORT} z TLS 1.3...")
+    
+    cli_thread = threading.Thread(target=start_cli)
+    cli_thread.daemon = True 
+    cli_thread.start()
 
     try:
         while True:
