@@ -149,7 +149,7 @@ def send_alert_with_retry(conn, session_token, current_temp):
     raise ConnectionError("Nie otrzymano ACK po 3 ponowieniach dla ALERT.")
 
 
-def process_incoming_frame(conn, session_token, header_bytes):
+def process_incoming_frame(conn, session_token, header_bytes, last_cmd_seq):
     resp_header = SimpHeader.decode(header_bytes)
     payload_bytes = b""
     if resp_header.payload_len > 0:
@@ -163,6 +163,10 @@ def process_incoming_frame(conn, session_token, header_bytes):
         ack_bytes = ack_payload.encode()
         ack_header = SimpHeader(1, MessageType.ACK, 0, session_token, len(ack_bytes))
         conn.sendall(ack_header.encode() + ack_bytes)
+        if cmd_payload.cmd_seq == last_cmd_seq:
+            print(
+                f"[*] Wykryto duplikat komendy (seq: {cmd_payload.cmd_seq}). Zignorowano wykonanie, samo ACK zostało odesłane.")
+            return ("CMD_DUPLICATE", None, last_cmd_seq)
         print(f"[+] Otrzymano COMMAND (ID: {cmd_payload.cmd_id}). Wysłano ACK (seq: {cmd_payload.cmd_seq}).")
 
         cmd_id = cmd_payload.cmd_id
@@ -175,30 +179,30 @@ def process_incoming_frame(conn, session_token, header_bytes):
             except Exception:
                 new_interval = 5
             print(f"[*] Wykonuję komendę SET_INTERVAL. Nowy interwał: {new_interval} s")
-            return ("CMD_SET_INTERVAL", new_interval)
+            return ("CMD_SET_INTERVAL", new_interval, cmd_payload.cmd_seq)
 
         elif cmd_id == 2:
             print("[*] Wykonuję komendę SET_THRESHOLD (Wkrótce wdrożone)...")
-            return ("CMD_SET_THRESHOLD", cmd_payload.param)
+            return ("CMD_SET_THRESHOLD", cmd_payload.param, cmd_payload.cmd_seq)
 
         elif cmd_id == 3:
             print("[!] Otrzymano komendę REBOOT. Wymuszam restart urządzenia...")
-            return ("CMD_REBOOT", None)
+            return ("CMD_REBOOT", None, cmd_payload.cmd_seq)
 
         else:
-            print(f"[!] Nieznana komenda (ID: {cmd_id}). Ignoruję.")
-            return ("CMD_UNKNOWN", None)
+            print(f"[!] Otrzymano nieznaną komendę (cmd_id: {cmd_id}). Ignoruję zawartość.")
+            return ("CMD_UNKNOWN", None, last_cmd_seq)
 
     elif resp_header.msg_type == MessageType.ERROR:
         err_data = ErrorPayload.decode(payload_bytes)
         raise ConnectionError(f"Serwer odesłał ERROR! Kod: {err_data.error_code.name}, Msg: {err_data.msg}")
 
     elif resp_header.msg_type == MessageType.PONG:
-        return ("PONG", None)
+        return ("PONG", None, last_cmd_seq)
 
     else:
         print(f"[!] Zignorowano nieoczekiwaną ramkę w tle: {resp_header.msg_type.name}")
-        return (resp_header.msg_type.name, None)
+        return (resp_header.msg_type.name, None, last_cmd_seq)
 
 def main():
     telemetry_buffer = deque(maxlen=100)
@@ -276,6 +280,7 @@ def main():
             #Cykliczne wyslanie telemetrii
             print("[*] Rozpoczynam wysyłanie telemetrii (CTRL+C aby przerwać)...")
             loops = 0
+            last_cmd_seq = None
 
             while True:
                 current_temp = random.uniform(20.0, 32.0)
@@ -305,7 +310,7 @@ def main():
                             if not hdr_bytes:
                                 raise ConnectionError("Brak odpowiedzi na PING (EOF).")
 
-                            f_type, f_param = process_incoming_frame(conn, session_token, hdr_bytes)
+                            f_type, f_param, last_cmd_seq = process_incoming_frame(conn, session_token, hdr_bytes, last_cmd_seq)
                             if f_type == "PONG":
                                 pong_received = True
                                 break
@@ -332,7 +337,7 @@ def main():
                         if not hdr_bytes:
                             raise ConnectionError("Rozłączono (EOF) w trakcie nasłuchiwania.")
 
-                        f_type, f_param = process_incoming_frame(conn, session_token, hdr_bytes)
+                        f_type, f_param, last_cmd_seq = process_incoming_frame(conn, session_token, hdr_bytes, last_cmd_seq)
                         if f_type == "CMD_SET_INTERVAL":
                             current_interval = f_param
                         elif f_type == "CMD_REBOOT":
