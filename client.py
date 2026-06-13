@@ -6,12 +6,14 @@ import sys
 import time
 import random
 import socket
+import select
 from collections import deque
 
 from simp_protocol import (
     SimpHeader, MessageType, ErrorType,
     HelloPayload, AuthPayload, AuthOkPayload, AuthFailPayload,
-    TelemetryPayload, AlertPayload, ErrorPayload
+    TelemetryPayload, AlertPayload, ErrorPayload,
+    CommandPayload, AckPayload
 )
 
 SERVER_HOST = '127.0.0.1'
@@ -146,6 +148,58 @@ def send_alert_with_retry(conn, session_token, current_temp):
 
     raise ConnectionError("Nie otrzymano ACK po 3 ponowieniach dla ALERT.")
 
+
+def process_incoming_frame(conn, session_token, header_bytes):
+    resp_header = SimpHeader.decode(header_bytes)
+    payload_bytes = b""
+    if resp_header.payload_len > 0:
+        payload_bytes = recv_exact(conn, resp_header.payload_len)
+
+    if resp_header.msg_type == MessageType.COMMAND:
+        cmd_payload = CommandPayload.decode(payload_bytes)
+
+        # Odsyłamy ACK
+        ack_payload = AckPayload(ack_seq=cmd_payload.cmd_seq)
+        ack_bytes = ack_payload.encode()
+        ack_header = SimpHeader(1, MessageType.ACK, 0, session_token, len(ack_bytes))
+        conn.sendall(ack_header.encode() + ack_bytes)
+        print(f"[+] Otrzymano COMMAND (ID: {cmd_payload.cmd_id}). Wysłano ACK (seq: {cmd_payload.cmd_seq}).")
+
+        cmd_id = cmd_payload.cmd_id
+        if cmd_id == 1:
+            try:
+                if isinstance(cmd_payload.param, bytes):
+                    new_interval = int(cmd_payload.param.decode().strip('\x00'))
+                else:
+                    new_interval = int(cmd_payload.param)
+            except Exception:
+                new_interval = 5
+            print(f"[*] Wykonuję komendę SET_INTERVAL. Nowy interwał: {new_interval} s")
+            return ("CMD_SET_INTERVAL", new_interval)
+
+        elif cmd_id == 2:
+            print("[*] Wykonuję komendę SET_THRESHOLD (Wkrótce wdrożone)...")
+            return ("CMD_SET_THRESHOLD", cmd_payload.param)
+
+        elif cmd_id == 3:
+            print("[!] Otrzymano komendę REBOOT. Wymuszam restart urządzenia...")
+            return ("CMD_REBOOT", None)
+
+        else:
+            print(f"[!] Nieznana komenda (ID: {cmd_id}). Ignoruję.")
+            return ("CMD_UNKNOWN", None)
+
+    elif resp_header.msg_type == MessageType.ERROR:
+        err_data = ErrorPayload.decode(payload_bytes)
+        raise ConnectionError(f"Serwer odesłał ERROR! Kod: {err_data.error_code.name}, Msg: {err_data.msg}")
+
+    elif resp_header.msg_type == MessageType.PONG:
+        return ("PONG", None)
+
+    else:
+        print(f"[!] Zignorowano nieoczekiwaną ramkę w tle: {resp_header.msg_type.name}")
+        return (resp_header.msg_type.name, None)
+
 def main():
     telemetry_buffer = deque(maxlen=100)
     backoff_steps = [5, 10, 20, 30]
@@ -203,7 +257,8 @@ def main():
                 raise ConnectionError("Nieoczekiwana ramka zamiast AUTH_OK.")
 
             backoff_index = 0
-            conn.settimeout(5.0)
+            conn.settimeout(None)
+            current_interval = 5
 
             if telemetry_buffer:
                 print(f"[*] Wykryto {len(telemetry_buffer)} zaległych odczytów w pamięci offline. Opróżniam bufor...")
@@ -228,46 +283,63 @@ def main():
 
                 if current_temp > 30.0:
                     send_alert_with_retry(conn, session_token, current_temp)
-                    time.sleep(5)
-                    continue
+                else:
+                    telemetry_payload = TelemetryPayload(sensor_type=1, timestamp=timestamp, value=current_temp)
+                    telemetry_bytes = telemetry_payload.encode()
+                    telemetry_header = SimpHeader(1, MessageType.TELEMETRY, 0, session_token, len(telemetry_bytes))
 
-                telemetry_payload = TelemetryPayload(
-                    sensor_type=1,
-                    timestamp=timestamp,
-                    value=current_temp
-                )
-                telemetry_bytes = telemetry_payload.encode()
-
-                telemetry_header = SimpHeader(
-                    version=1,
-                    msg_type=MessageType.TELEMETRY,
-                    flags=0,
-                    session_token=session_token,  # zapisany token
-                    payload_len=len(telemetry_bytes)
-                )
-
-                conn.sendall(telemetry_header.encode() + telemetry_bytes)
-                current_time = datetime.datetime.fromtimestamp(timestamp).strftime('%H:%M:%S')
-                print(f"[>] [{current_time}] Wysłano TELEMETRY: {current_temp:.2f}°C")
+                    conn.sendall(telemetry_header.encode() + telemetry_bytes)
+                    current_time = datetime.datetime.fromtimestamp(timestamp).strftime('%H:%M:%S')
+                    print(f"[>] [{current_time}] Wysłano TELEMETRY: {current_temp:.2f}°C")
 
                 if loops % 4 == 0:
                     ping_header = SimpHeader(1, MessageType.PING, 0, session_token, 0)
                     conn.sendall(ping_header.encode())
 
-                    pong_header_bytes = recv_exact(conn, 15)
-                    if not pong_header_bytes:
-                        raise ConnectionError("Brak odpowiedzi na PING (EOF).")
-                    pong_header = SimpHeader.decode(pong_header_bytes)
-                    if pong_header.msg_type == MessageType.ERROR:
-                        err_payload_bytes = recv_exact(conn, pong_header.payload_len)
-                        err_data = ErrorPayload.decode(err_payload_bytes)
-                        raise ConnectionError(
-                            f"Serwer odesłał ERROR! Kod: {err_data.error_code.name}, Wiadomość: {err_data.msg}")
+                    pong_start = time.time()
+                    pong_received = False
+                    while time.time() - pong_start < 5.0:
+                        ready, _, _ = select.select([conn], [], [], 5.0 - (time.time() - pong_start))
+                        if ready:
+                            hdr_bytes = recv_exact(conn, 15)
+                            if not hdr_bytes:
+                                raise ConnectionError("Brak odpowiedzi na PING (EOF).")
 
-                    elif pong_header.msg_type != MessageType.PONG:
-                        raise ConnectionError(f"Oczekiwano PONG, otrzymano {pong_header.msg_type.name}")
+                            f_type, f_param = process_incoming_frame(conn, session_token, hdr_bytes)
+                            if f_type == "PONG":
+                                pong_received = True
+                                break
+                            elif f_type == "CMD_SET_INTERVAL":
+                                current_interval = f_param
+                            elif f_type == "CMD_REBOOT":
+                                sys.exit(0)
+                        else:
+                            break
 
-                time.sleep(5)
+                    if not pong_received:
+                        raise ConnectionError("Brak odpowiedzi na PING (Timeout 5s).")
+
+                sleep_start = time.time()
+                while True:
+                    elapsed = time.time() - sleep_start
+                    time_left = current_interval - elapsed
+                    if time_left <= 0:
+                        break
+
+                    ready, _, _ = select.select([conn], [], [], time_left)
+                    if ready:
+                        hdr_bytes = recv_exact(conn, 15)
+                        if not hdr_bytes:
+                            raise ConnectionError("Rozłączono (EOF) w trakcie nasłuchiwania.")
+
+                        f_type, f_param = process_incoming_frame(conn, session_token, hdr_bytes)
+                        if f_type == "CMD_SET_INTERVAL":
+                            current_interval = f_param
+                        elif f_type == "CMD_REBOOT":
+                            sys.exit(0)
+                    else:
+                        break
+
                 loops += 1
 
         except (socket.error, ConnectionError, ssl.SSLError) as e:
@@ -296,6 +368,11 @@ def main():
         except KeyboardInterrupt:
             print("\n[*] Zamykanie symulatora czujnika...")
             if conn:
+                try:
+                    bye_header = SimpHeader(1, MessageType.BYE, 0, session_token, 0)
+                    conn.sendall(bye_header.encode())
+                except:
+                    pass
                 conn.close()
             sys.exit(0)
 
