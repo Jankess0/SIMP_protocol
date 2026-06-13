@@ -4,10 +4,11 @@ import hashlib
 import sys
 import time
 import random
+import socket
 from simp_protocol import (
     SimpHeader, MessageType, ErrorType,
     HelloPayload, AuthPayload, AuthOkPayload, AuthFailPayload,
-    TelemetryPayload
+    TelemetryPayload, AlertPayload
 )
 
 SERVER_HOST = '127.0.0.1'
@@ -67,6 +68,66 @@ def create_tls_connection(host: str, port: int, expected_fingerprint: str) -> ss
         tls_sock.close()
         raise e
 
+
+def send_alert_with_retry(conn, session_token, current_temp):
+    """
+    Wysyła ramkę ALERT i czeka na ACK.
+    W przypadku braku odpowiedzi w ciągu 10s ponawia wysyłkę (max 3 razy).
+    """
+    print(f"\n[!] WYKRYTO ALARM: Temperatura {current_temp:.2f}°C przekracza próg!")
+
+    alert_payload = AlertPayload(
+        alert_code=1,
+        sensor_type=1,
+        value=current_temp
+    )
+    alert_bytes = alert_payload.encode()
+
+    alert_header = SimpHeader(
+        version=1,
+        msg_type=MessageType.ALERT,
+        flags=0x01,
+        session_token=session_token,
+        payload_len=len(alert_bytes)
+    )
+    packet = alert_header.encode() + alert_bytes
+
+    max_retries = 3
+    conn.settimeout(10.0)
+
+    for attempt in range(1, max_retries + 2):
+        if attempt > 1:
+            print(f"[*] Brak ACK. Ponawiam wysyłkę ALERT (próba {attempt - 1}/{max_retries})...")
+
+        conn.sendall(packet)
+
+        try:
+            header_bytes = recv_exact(conn, 15)
+            if not header_bytes:
+                print("[-] Serwer rozłączył się w trakcie oczekiwania na ACK.")
+                sys.exit(1)
+
+            resp_header = SimpHeader.decode(header_bytes)
+
+            if resp_header.payload_len > 0:
+                recv_exact(conn, resp_header.payload_len)
+
+            if resp_header.msg_type == MessageType.ACK:
+                print("[+] Otrzymano potwierdzenie ACK od serwera dla ALERTU.\n")
+
+                conn.settimeout(1.0)
+                return
+            else:
+                print(f"[-] Oczekiwano ACK, otrzymano {resp_header.msg_type.name}. Oczekuję dalej...")
+
+        except socket.timeout:
+            continue
+
+    print("[-] Błąd krytyczny: Nie otrzymano ACK po 3 ponowieniach.")
+
+    conn.close()
+    sys.exit(1)
+
 def main():
     try:
         #Nawiazanie polaczenia
@@ -123,9 +184,16 @@ def main():
 
         #Cykliczne wyslanie telemetrii
         print("[*] Rozpoczynam wysyłanie telemetrii (CTRL+C aby przerwać)...")
+        conn.settimeout(1.0)
+
         while True:
-            current_temp = random.uniform(20.0, 25.0)
+            current_temp = random.uniform(20.0, 32.0)
             timestamp = int(time.time())
+
+            if current_temp > 30.0:
+                send_alert_with_retry(conn, session_token, current_temp)
+                time.sleep(5)
+                continue
 
             telemetry_payload = TelemetryPayload(
                 sensor_type=1,
