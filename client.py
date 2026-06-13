@@ -1,3 +1,4 @@
+import datetime
 import socket
 import ssl
 import hashlib
@@ -5,10 +6,12 @@ import sys
 import time
 import random
 import socket
+from collections import deque
+
 from simp_protocol import (
     SimpHeader, MessageType, ErrorType,
     HelloPayload, AuthPayload, AuthOkPayload, AuthFailPayload,
-    TelemetryPayload, AlertPayload
+    TelemetryPayload, AlertPayload, ErrorPayload
 )
 
 SERVER_HOST = '127.0.0.1'
@@ -123,107 +126,178 @@ def send_alert_with_retry(conn, session_token, current_temp):
         except socket.timeout:
             continue
 
-    print("[-] Błąd krytyczny: Nie otrzymano ACK po 3 ponowieniach.")
+    print("[-] Błąd krytyczny: Nie otrzymano ACK po 3 ponowieniach. Wysyłam ERROR TIMEOUT.")
 
-    conn.close()
-    sys.exit(1)
+    err_payload = ErrorPayload(error_code=ErrorType.TIMEOUT, msg="ACK timeout")
+    err_bytes = err_payload.encode()
+
+    err_header = SimpHeader(
+        version=1,
+        msg_type=MessageType.ERROR,
+        flags=0,
+        session_token=session_token,
+        payload_len=len(err_bytes)
+    )
+
+    try:
+        conn.sendall(err_header.encode() + err_bytes)
+    except Exception:
+        pass
+
+    raise ConnectionError("Nie otrzymano ACK po 3 ponowieniach dla ALERT.")
 
 def main():
-    try:
-        #Nawiazanie polaczenia
-        conn = create_tls_connection(SERVER_HOST, SERVER_PORT, EXPECTED_FINGERPRINT)
+    telemetry_buffer = deque(maxlen=100)
+    backoff_steps = [5, 10, 20, 30]
+    backoff_index = 0
 
-        #Init sesji - wyslanie HELLO
-        print(f"[*] Wysyłam HELLO (Device ID: {DEVICE_ID})...")
-        hello_payload = HelloPayload(device_id=DEVICE_ID)
-        hello_bytes = hello_payload.encode()
-        hello_header = SimpHeader(
-            version=1,
-            msg_type=MessageType.HELLO,
-            flags=0,
-            session_token=0,
-            payload_len=len(hello_bytes)
-        )
-        conn.sendall(hello_header.encode() + hello_bytes)
+    print("[*] Uruchamiam symulator sensora SIMP...")
+    while True:
+        conn = None
+        try:
+            #Nawiazanie polaczenia
+            conn = create_tls_connection(SERVER_HOST, SERVER_PORT, EXPECTED_FINGERPRINT)
 
-        #Uwierzytelnienie - wyslanie AUTH
-        print("[*] Wysyłam AUTH (Hasło)...")
-        auth_payload = AuthPayload(password=PASSWORD)
-        auth_bytes = auth_payload.encode()
-        auth_header = SimpHeader(
-            version=1,
-            msg_type=MessageType.AUTH,
-            flags=0,
-            session_token=0,
-            payload_len=len(auth_bytes)
-        )
-        conn.sendall(auth_header.encode() + auth_bytes)
-
-        # Oczekiwanie na odpowiedz serwera
-        header_bytes = recv_exact(conn, 15)
-        if not header_bytes:
-            raise ConnectionError("Serwer zamknął połączenie przed autoryzacją.")
-
-        resp_header = SimpHeader.decode(header_bytes)
-        resp_payload_bytes = recv_exact(conn, resp_header.payload_len)
-
-        if resp_header.msg_type == MessageType.AUTH_FAIL:
-            fail_payload = AuthFailPayload.decode(resp_payload_bytes)
-            print(f"[!] Autoryzacja odrzucona! Kod błędu: {fail_payload.error_code.name}")
-            conn.close()
-            sys.exit(1)
-
-        elif resp_header.msg_type == MessageType.AUTH_OK:
-            ok_payload = AuthOkPayload.decode(resp_payload_bytes)
-            session_token = ok_payload.session_token
-            print(f"[+] Autoryzacja pomyślna! Otrzymano token sesji: {session_token}")
-        else:
-            print(f"[!] Nieoczekiwana odpowiedź serwera: {resp_header.msg_type.name}")
-            conn.close()
-            sys.exit(1)
-
-        #Cykliczne wyslanie telemetrii
-        print("[*] Rozpoczynam wysyłanie telemetrii (CTRL+C aby przerwać)...")
-        conn.settimeout(1.0)
-
-        while True:
-            current_temp = random.uniform(20.0, 32.0)
-            timestamp = int(time.time())
-
-            if current_temp > 30.0:
-                send_alert_with_retry(conn, session_token, current_temp)
-                time.sleep(5)
-                continue
-
-            telemetry_payload = TelemetryPayload(
-                sensor_type=1,
-                timestamp=timestamp,
-                value=current_temp
-            )
-            telemetry_bytes = telemetry_payload.encode()
-
-            telemetry_header = SimpHeader(
+            #Init sesji - wyslanie HELLO
+            print(f"[*] Wysyłam HELLO (Device ID: {DEVICE_ID})...")
+            hello_payload = HelloPayload(device_id=DEVICE_ID)
+            hello_bytes = hello_payload.encode()
+            hello_header = SimpHeader(
                 version=1,
-                msg_type=MessageType.TELEMETRY,
+                msg_type=MessageType.HELLO,
                 flags=0,
-                session_token=session_token,  # zapisany token
-                payload_len=len(telemetry_bytes)
+                session_token=0,
+                payload_len=len(hello_bytes)
             )
+            conn.sendall(hello_header.encode() + hello_bytes)
 
-            conn.sendall(telemetry_header.encode() + telemetry_bytes)
-            print(f"[>] Wysłano TELEMETRY: {current_temp:.2f}°C")
+            #Uwierzytelnienie - wyslanie AUTH
+            print("[*] Wysyłam AUTH (Hasło)...")
+            auth_payload = AuthPayload(password=PASSWORD)
+            auth_bytes = auth_payload.encode()
+            auth_header = SimpHeader(
+                version=1,
+                msg_type=MessageType.AUTH,
+                flags=0,
+                session_token=0,
+                payload_len=len(auth_bytes)
+            )
+            conn.sendall(auth_header.encode() + auth_bytes)
 
-            time.sleep(5)
+            # Oczekiwanie na odpowiedz serwera
+            header_bytes = recv_exact(conn, 15)
+            if not header_bytes:
+                raise ConnectionError("Serwer zamknął połączenie przed autoryzacją.")
 
-    except KeyboardInterrupt:
-        print("\n[*] Zamykanie symulatora czujnika...")
-    except Exception as e:
-        print(f"\n[!] Błąd krytyczny klienta: {e}")
-        sys.exit(1)
-    finally:
-        if 'conn' in locals():
-            conn.close()
-            print("[*] Połączenie zamknięte.")
+            resp_header = SimpHeader.decode(header_bytes)
+            resp_payload_bytes = recv_exact(conn, resp_header.payload_len)
+
+            if resp_header.msg_type == MessageType.AUTH_FAIL:
+                print("[!] Autoryzacja odrzucona! Błędne hasło.")
+                sys.exit(1)
+
+            elif resp_header.msg_type == MessageType.AUTH_OK:
+                session_token = AuthOkPayload.decode(resp_payload_bytes).session_token
+                print(f"[+] Autoryzacja pomyślna! Otrzymano token sesji: {session_token}")
+            else:
+                raise ConnectionError("Nieoczekiwana ramka zamiast AUTH_OK.")
+
+            backoff_index = 0
+            conn.settimeout(5.0)
+
+            if telemetry_buffer:
+                print(f"[*] Wykryto {len(telemetry_buffer)} zaległych odczytów w pamięci offline. Opróżniam bufor...")
+                for past_telemetry in list(telemetry_buffer):
+                    t_bytes = past_telemetry.encode()
+                    t_header = SimpHeader(1, MessageType.TELEMETRY, 0, session_token, len(t_bytes))
+                    conn.sendall(t_header.encode() + t_bytes)
+                    past_time = datetime.datetime.fromtimestamp(past_telemetry.timestamp).strftime('%H:%M:%S')
+                    print(f" [^] Wysłano ZALEGŁE TELEMETRY z {past_time} -> {past_telemetry.value:.2f}°C")
+                    time.sleep(0.05)
+
+                telemetry_buffer.clear()
+                print("[+] Bufor opróżniony.")
+
+            #Cykliczne wyslanie telemetrii
+            print("[*] Rozpoczynam wysyłanie telemetrii (CTRL+C aby przerwać)...")
+            loops = 0
+
+            while True:
+                current_temp = random.uniform(20.0, 32.0)
+                timestamp = int(time.time())
+
+                if current_temp > 30.0:
+                    send_alert_with_retry(conn, session_token, current_temp)
+                    time.sleep(5)
+                    continue
+
+                telemetry_payload = TelemetryPayload(
+                    sensor_type=1,
+                    timestamp=timestamp,
+                    value=current_temp
+                )
+                telemetry_bytes = telemetry_payload.encode()
+
+                telemetry_header = SimpHeader(
+                    version=1,
+                    msg_type=MessageType.TELEMETRY,
+                    flags=0,
+                    session_token=session_token,  # zapisany token
+                    payload_len=len(telemetry_bytes)
+                )
+
+                conn.sendall(telemetry_header.encode() + telemetry_bytes)
+                current_time = datetime.datetime.fromtimestamp(timestamp).strftime('%H:%M:%S')
+                print(f"[>] [{current_time}] Wysłano TELEMETRY: {current_temp:.2f}°C")
+
+                if loops % 4 == 0:
+                    ping_header = SimpHeader(1, MessageType.PING, 0, session_token, 0)
+                    conn.sendall(ping_header.encode())
+
+                    pong_header_bytes = recv_exact(conn, 15)
+                    if not pong_header_bytes:
+                        raise ConnectionError("Brak odpowiedzi na PING (EOF).")
+                    pong_header = SimpHeader.decode(pong_header_bytes)
+                    if pong_header.msg_type == MessageType.ERROR:
+                        err_payload_bytes = recv_exact(conn, pong_header.payload_len)
+                        err_data = ErrorPayload.decode(err_payload_bytes)
+                        raise ConnectionError(
+                            f"Serwer odesłał ERROR! Kod: {err_data.error_code.name}, Wiadomość: {err_data.msg}")
+
+                    elif pong_header.msg_type != MessageType.PONG:
+                        raise ConnectionError(f"Oczekiwano PONG, otrzymano {pong_header.msg_type.name}")
+
+                time.sleep(5)
+                loops += 1
+
+        except (socket.error, ConnectionError, ssl.SSLError) as e:
+            print(f"\n[!] BŁĄD POŁĄCZENIA: {e}")
+            if conn:
+                try:
+                    conn.close()
+                except:
+                    pass
+
+            wait_time = backoff_steps[backoff_index]
+            print(f"[*] Tryb OFFLINE. Kolejna próba za {wait_time} sekund...")
+
+            if backoff_index < len(backoff_steps) - 1:
+                backoff_index += 1
+
+            for _ in range(wait_time // 5):
+                offline_val = random.uniform(20.0, 25.0)
+                offline_ts = int(time.time())
+                offline_payload = TelemetryPayload(sensor_type=1, timestamp=offline_ts, value=offline_val)
+                telemetry_buffer.append(offline_payload)
+                offline_time = datetime.datetime.fromtimestamp(offline_ts).strftime('%H:%M:%S')
+                print(f" [Bufor] [{offline_time}] Zapisano odczyt w pamięci lokalnej ({len(telemetry_buffer)}/100)")
+                time.sleep(5)
+
+        except KeyboardInterrupt:
+            print("\n[*] Zamykanie symulatora czujnika...")
+            if conn:
+                conn.close()
+            sys.exit(0)
 
 
 if __name__ == "__main__":
