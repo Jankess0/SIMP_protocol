@@ -347,7 +347,7 @@ def main():
 
                 loops += 1
 
-        except (socket.error, ConnectionError, ssl.SSLError) as e:
+        except (socket.error, ConnectionError, ssl.SSLError, EOFError) as e:
             print(f"\n[!] BŁĄD POŁĄCZENIA: {e}")
             if conn:
                 try:

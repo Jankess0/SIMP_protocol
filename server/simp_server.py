@@ -2,8 +2,10 @@ import socket
 import ssl
 import threading
 
-from server.session import handle_client
+from server.session import handle_client, ACTIVE_SESSIONS, session_lock
 from server.storage import init_storage
+from server.cli import start_cli
+from simp_protocol import SimpHeader, MessageType
 
 HOST = '0.0.0.0'
 PORT = 8883
@@ -25,6 +27,10 @@ def start_server():
     server_socket.listen(50) 
     
     print(f"[*] Serwer SIMP nasłuchuje na {HOST}:{PORT} z TLS 1.3...")
+    
+    cli_thread = threading.Thread(target=start_cli)
+    cli_thread.daemon = True 
+    cli_thread.start()
 
     try:
         while True:
@@ -41,7 +47,17 @@ def start_server():
                 client_sock.close()
                 
     except KeyboardInterrupt:
-        print("\n[*] Wyłączanie serwera...")
+        with session_lock:
+            for dev_id, conn in list(ACTIVE_SESSIONS.items()):
+                try:
+                    bye_header = SimpHeader(1, MessageType.BYE, 0, 0, 0)
+                    conn.sendall(bye_header.encode())
+                    conn.close()
+                    print(f"[*] Wymuszono rozłączenie urządzenia {dev_id}")
+                except Exception as e:
+                    print(f"[-] Błąd podczas rozłączania {dev_id}: {e}")
+            
+            ACTIVE_SESSIONS.clear()
     finally:
         server_socket.close()
 
