@@ -61,6 +61,9 @@ def handle_client(conn: ssl.SSLSocket, addr: tuple):
 
         # WERYFIKACJA
         if verify_device(device_id, password):
+            
+            # !!!! w przypadku testownia obciazeniowego zakomentowac blok oznaczony blok kodu !!!!
+            #=====================================================================================
             with session_lock:
                 if device_id in ACTIVE_SESSIONS:
                     print(f"[-] Odrzucono połączenie: Urządzenie {device_id} jest już połączone!")
@@ -72,7 +75,7 @@ def handle_client(conn: ssl.SSLSocket, addr: tuple):
                 
                 ACTIVE_SESSIONS[device_id] = conn
                 session_registered = True
-                
+            #=====================================================================================   
             session_token = generate_session_token()
             ok_payload_bytes = AuthOkPayload(session_token=session_token).encode()
             ok_header = SimpHeader(1, MessageType.AUTH_OK, 0, 0, len(ok_payload_bytes))
