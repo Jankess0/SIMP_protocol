@@ -40,6 +40,7 @@ def handle_client(conn: ssl.SSLSocket, addr: tuple):
     print(f"\n[+] Nowe bezpieczne połączenie od: {addr}")
     
     device_id = None
+    session_registered = False
     
     try:
         conn.settimeout(15.0)
@@ -60,6 +61,18 @@ def handle_client(conn: ssl.SSLSocket, addr: tuple):
 
         # WERYFIKACJA
         if verify_device(device_id, password):
+            with session_lock:
+                if device_id in ACTIVE_SESSIONS:
+                    print(f"[-] Odrzucono połączenie: Urządzenie {device_id} jest już połączone!")
+                    fail_payload = AuthFailPayload(error_code=ErrorType.AUTH_INVALID).encode()
+                    fail_header = SimpHeader(1, MessageType.AUTH_FAIL, 0, 0, len(fail_payload))
+                    conn.sendall(fail_header.encode() + fail_payload)
+                    return 
+
+                
+                ACTIVE_SESSIONS[device_id] = conn
+                session_registered = True
+                
             session_token = generate_session_token()
             ok_payload_bytes = AuthOkPayload(session_token=session_token).encode()
             ok_header = SimpHeader(1, MessageType.AUTH_OK, 0, 0, len(ok_payload_bytes))
@@ -131,6 +144,6 @@ def handle_client(conn: ssl.SSLSocket, addr: tuple):
     except Exception as e:
         print(f"[-] Błąd w sesji z {addr}: {e}")
     finally:
-        if device_id is not None:
+        if session_registered:
             remove_session(device_id)
         conn.close()
